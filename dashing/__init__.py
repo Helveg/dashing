@@ -64,8 +64,8 @@ import abc
 import contextlib
 import itertools
 from collections import deque, namedtuple
-from enum import Enum
-from typing import Literal, Optional, Tuple, Union
+from enum import IntEnum
+from typing import Iterable, Literal, Optional, Sequence, Tuple, Union
 
 from blessed import Terminal
 
@@ -85,7 +85,7 @@ braille_r_left = (0x04, 0x02, 0x01)
 braille_r_right = (0x20, 0x10, 0x08)
 
 
-class Color(Enum):
+class Color(IntEnum):
     Black = 0
     Red = 1
     Green = 2
@@ -94,6 +94,16 @@ class Color(Enum):
     Magenta = 5
     Cyan = 6
     White = 7
+
+
+class Side(IntEnum):
+    Left = 0
+    Right = 1
+
+
+class Clip(IntEnum):
+    Head = 0
+    Tail = 1
 
 
 ColorLiteral = Literal[0, 1, 2, 3, 4, 5, 6, 7]
@@ -240,7 +250,38 @@ class HSplit(Split):
     pass
 
 
-class Text(Tile):
+class _Multiline(Tile):
+    """
+    An abstract multi-line text box. Requires to be subclassed.
+    """
+
+    def __init__(self, color: ColorValue = Color.Black, **kw):
+        super().__init__(**kw)
+        self.color = color
+
+    @abc.abstractmethod
+    def _lines(self, width: int, height: int) -> Iterable[str]:
+        """
+        Return max `height` lines to be rendered in the multiline tile.
+        """
+        pass
+
+    def _display(self, tbox: TBox, parent: Optional[Tile]):
+        tbox = self._draw_borders_and_title(tbox)
+        for dx, line in pad(self._lines(tbox.w, tbox.h), tbox.h):
+            if dx >= tbox.h:
+                break
+            if len(line) >= tbox.w:
+                line = line[: tbox.w - 1] + "…"
+            print(
+                tbox.t.color(self.color)
+                + tbox.t.move(tbox.x + dx, tbox.y)
+                + line[: tbox.w]
+                + " " * (tbox.w - len(line))
+            )
+
+
+class Text(_Multiline):
     """
     A multi-line text box. Example::
 
@@ -248,43 +289,97 @@ class Text(Tile):
 
     """
 
-    def __init__(self, text: str, color: ColorValue = Color.Black, **kw):
+    def __init__(self, text: str, clip=Clip.Head, **kw):
         super().__init__(**kw)
-        self.text: str = text
-        self.color = color
+        self.text = text
+        self.clip = clip
 
-    def _display(self, tbox: TBox, parent: Optional[Tile]):
-        tbox = self._draw_borders_and_title(tbox)
-        for dx, line in pad(self.text.splitlines()[-(tbox.h) :], tbox.h):
-            print(
-                tbox.t.color(self.color)
-                + tbox.t.move(tbox.x + dx, tbox.y)
-                + line
-                + " " * (tbox.w - len(line))
-            )
+    @property
+    def text(self):
+        return self._text
+
+    @text.setter
+    def text(self, value: str):
+        self._text = value
+        self._textlines = value.splitlines()
+
+    def _lines(self, width, height: int):
+        yield from (
+            self._textlines if self.clip == Clip.Head else self._textlines[-height:]
+        )
 
 
-class Log(Tile):
+class Log(_Multiline):
     """A log pane that scrolls automatically.
     Add new lines with :meth:`append`
     """
 
-    def __init__(self, **kw):
+    def __init__(self, clip=Clip.Tail, **kw):
         super().__init__(**kw)
         self.logs = deque(maxlen=50)
+        self.clip = clip
 
-    def _display(self, tbox: TBox, parent: Optional[Tile]):
-        tbox = self._draw_borders_and_title(tbox)
+    def _lines(self, width: int, height: int):
         n_logs = len(self.logs)
-        log_range = min(n_logs, tbox.h)
+        log_range = min(n_logs, height)
         start = n_logs - log_range
-        print(tbox.t.color(self.color))
-        for dx, line in pad((self.logs[ln] for ln in range(start, n_logs)), tbox.h):
-            print(tbox.t.move(tbox.x + dx, tbox.y) + line + " " * (tbox.w - len(line)))
+        if self.clip == Clip.Tail:
+            clipped_range = range(start, n_logs)
+        else:
+            clipped_range = range(n_logs, start, -1)
+        yield from (self.logs[ln] for ln in clipped_range)
 
     def append(self, msg: str):
         """Append a new log message at the bottom"""
         self.logs.append(msg)
+
+
+class DoubleColumn(_Multiline):
+    """
+    A list with a label column and value column
+    """
+
+    def __init__(
+        self,
+        lines: Sequence[Tuple[str, str]],
+        sep=": ",
+        trunc_col=Side.Left,
+        trunc=Side.Right,
+        clip=Clip.Head,
+        **kw,
+    ):
+        super().__init__(**kw)
+        self.lines = lines
+        self.sep = sep
+        self.trunc = trunc
+        self.trunc_col = trunc_col
+        self.clip = clip
+
+    def _lines(self, width: int, height: int):
+        if self.clip == Clip.Head:
+            lines = self.lines[:height]
+        else:
+            lines = self.lines[-height:]
+        size_col = not self.trunc_col
+        size = min(
+            width - 1 - len(self.sep),
+            max((len(cols[size_col]) for cols in lines), default=1),
+        )
+        trunc_size = width - size
+        for cols in lines:
+            cols = [*cols]
+            trunc_text = cols[self.trunc_col]
+            size_text = cols[size_col]
+            if len(trunc_text) > trunc_size:
+                if self.trunc == Side.Left:
+                    trunc_text = "…" + trunc_text[-trunc_size + 1 :]
+                else:
+                    trunc_text = trunc_text[: trunc_size - 1] + "…"
+                cols[self.trunc_col] = trunc_text
+            if len(size_text) > size:
+                cols[size_col] = size_text[: size - 1] + "…"
+
+            yield f"{cols[0]}{self.sep}{cols[1]}"
 
 
 class HGauge(Tile):
